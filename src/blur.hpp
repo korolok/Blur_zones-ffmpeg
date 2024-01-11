@@ -1,6 +1,8 @@
 #include <iostream>
 #include <opencv4/opencv2/opencv.hpp>
 #include <unistd.h>
+#include <fstream>
+#include "json.hpp"
 
 extern "C"
 {
@@ -31,14 +33,22 @@ class VideoCapture {
 
     AVFrame *av_frame_gray = nullptr;
     AVFrame *av_frame_rgb = nullptr;
+    AVFrame *temp_frame = nullptr;
 
-    SwsContext *_sws_ctx = nullptr;
+    SwsContext *sws_ctx = nullptr;
     SwsContext *sws_ctx_rgb = nullptr;
 
     cv::Mat cv_frame;
 
-    int vid_stream = -1;
+    std::string video_path;
+    std::string cam_url;
+    std::string grid;
+    int *grid_pos;
+    int grid_y;
+    int grid_x;
+    int kernel;
 
+    int vid_stream = -1;
     int frameCounter;
 
     int init_decode();
@@ -49,7 +59,13 @@ class VideoCapture {
 
     void setup_sws();
 
+    void blurPieces();
+    int* gen_grid();
+    std::vector<std::string> split(const std::string s, char delim);
+
+    void parse_config(int argc, char **argv);
+
     public:
-    int start();
-    int stop();
+    void start(int argc, char** argv);
+    void stop();
 };

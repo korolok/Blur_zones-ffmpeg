@@ -1,23 +1,27 @@
 #include "blur.hpp"
 
-int main()
+int main(int argc, char **argv)
 {
     auto blur = std::make_shared<VideoCapture>();
 
-    blur -> start();
+    blur -> start(argc, argv);
     blur -> stop();
 
     return 0;
 }
 
 
-int VideoCapture::start()
+void VideoCapture::start(int argc, char** argv)
 {
+    parse_config(argc, argv);
+
     init_decode();
 
     setup_sws();
 
     init_encoder();
+
+    grid_pos = gen_grid();
 
     packet = av_packet_alloc();
 
@@ -30,7 +34,7 @@ int VideoCapture::start()
 
         if (frame->pkt_size > 0)
         {
-            sws_scale(_sws_ctx,
+            sws_scale(sws_ctx,
                       frame->data,
                       frame->linesize,
                       0,
@@ -38,30 +42,33 @@ int VideoCapture::start()
                       av_frame_gray->data,
                       av_frame_gray->linesize);
         
-            cv::Mat cv_frame(av_frame_gray->height, av_frame_gray->width, CV_8UC3, av_frame_gray->data[0]);
+            cv_frame = cv::Mat(av_frame_gray->height, av_frame_gray->width, CV_8UC3, av_frame_gray->data[0]);
 
-            av_image_fill_arrays(frame->data, av_frame_gray->linesize, cv_frame.data, AV_PIX_FMT_BGR24, av_frame_gray->width, av_frame_gray->height, 1);
+            blurPieces();
+
+            av_image_fill_arrays(temp_frame->data, temp_frame->linesize, cv_frame.data, AV_PIX_FMT_BGR24, temp_frame->width, temp_frame->height, 1);
 
             sws_scale(sws_ctx_rgb,
-                      frame->data,
-                      frame->linesize,
+                      temp_frame->data,
+                      temp_frame->linesize,
                       0,
-                      frame->height,
+                      temp_frame->height,
                       av_frame_rgb->data,
                       av_frame_rgb->linesize);
 
+            cv::resize(cv_frame, cv_frame, cv::Size(800, 600));
             cv::imshow("Window", cv_frame);
         }
-        
-        av_packet_unref(packet);
 
         av_frame_rgb->pts = frameCounter++;
 
         std::cout << "send: " << avcodec_send_frame(encode_ctx, av_frame_rgb) << std::endl;
-
         std::cout << "receive: " << avcodec_receive_packet(encode_ctx, packet) << std::endl;
+        std::cout << "write frame: " << write_frame() << std::endl;
+        std::cout << std::endl;
 
-        write_frame();
+        av_frame_unref(frame); 
+        av_packet_unref(packet);
 
         if (cv::waitKey(1) >= 0)
         {
@@ -70,14 +77,12 @@ int VideoCapture::start()
     }
 
     av_write_trailer(ofctx);
-
-    return 0;
 }
 
 
 int VideoCapture::init_decode()
 {
-    avformat_open_input(&format_ctx, "rtsp://admin:Admin1234@10.24.72.84:554/ch01.264?dev=1", nullptr, nullptr);
+    avformat_open_input(&format_ctx, cam_url.c_str(), nullptr, nullptr);
 
     avformat_find_stream_info(format_ctx, nullptr);
     
@@ -106,13 +111,12 @@ int VideoCapture::init_decode()
 int VideoCapture::init_encoder()
 {
     int ret = 0;
-    const char *filename = "./test.mp4";
 
-    avformat_alloc_output_context2(&ofctx, NULL, NULL, filename);
+    avformat_alloc_output_context2(&ofctx, NULL, NULL, video_path.c_str());
     if (!ofctx) 
     {
         std::cout << "Couldnt open file in format." << std::endl;
-        avformat_alloc_output_context2(&ofctx, NULL, "mpeg", filename);
+        avformat_alloc_output_context2(&ofctx, NULL, "mpeg", video_path.c_str());
     }
     if (!ofctx)
     {
@@ -141,7 +145,6 @@ int VideoCapture::init_encoder()
         return 0;
     }
     video_stream->id = ofctx->nb_streams - 1;
-    // video_stream->avg_frame_rate = AVRational{ 1, 25};
 
     encode_ctx = avcodec_alloc_context3(encode);
     if (!encode_ctx) 
@@ -171,7 +174,6 @@ int VideoCapture::init_encoder()
 
     if (oformat->flags & AVFMT_GLOBALHEADER) encode_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-    // Открываем кодек.
     ret = avcodec_open2(encode_ctx, encode, NULL);
     if (ret < 0) 
     {
@@ -179,7 +181,6 @@ int VideoCapture::init_encoder()
         return 0;
     }
 
-    /* copy the stream parameters to the muxer */
     ret = avcodec_parameters_from_context(video_stream->codecpar, encode_ctx);
     if (ret < 0) 
     {
@@ -187,15 +188,14 @@ int VideoCapture::init_encoder()
         return 0;
     }
 
-    av_dump_format(ofctx, 0, filename, 1);
+    av_dump_format(ofctx, 0, video_path.c_str(), 1);
 
-    /* open the output file, if needed */
     if (!(oformat->flags & AVFMT_NOFILE)) 
     {
-        ret = avio_open(&ofctx->pb, filename, AVIO_FLAG_WRITE);
+        ret = avio_open(&ofctx->pb, video_path.c_str(), AVIO_FLAG_WRITE);
         if (ret < 0) 
         {
-            std::cout << "Could not open " << filename << " : " << av_err2str(ret) << std::endl;
+            std::cout << "Could not open " << video_path << " : " << av_err2str(ret) << std::endl;
             return 0;
         }
     }
@@ -225,9 +225,7 @@ void VideoCapture::setup_sws()
     int _height = codec_ctx->height;
     int _width = codec_ctx->width;
 
-    // codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-
-    _sws_ctx = sws_getContext(_width,
+    sws_ctx = sws_getContext(_width,
                               _height,
                               codec_ctx->pix_fmt,
                               _width,
@@ -255,6 +253,12 @@ void VideoCapture::setup_sws()
     av_frame_gray->height = _height;
     av_image_alloc(av_frame_gray->data, av_frame_gray->linesize, av_frame_gray->width, av_frame_gray->height, AV_PIX_FMT_BGR24, 1);
 
+    temp_frame = av_frame_alloc();
+    temp_frame->format = AV_PIX_FMT_BGR24;
+    temp_frame->width = _width;
+    temp_frame->height = _height;
+    av_image_alloc(temp_frame->data, temp_frame->linesize, temp_frame->width, temp_frame->height, codec_ctx->pix_fmt, 1);
+
     av_frame_rgb = av_frame_alloc();
     av_frame_rgb->format = codec_ctx->pix_fmt;
     av_frame_rgb->width = _width;
@@ -262,7 +266,184 @@ void VideoCapture::setup_sws()
     av_image_alloc(av_frame_rgb->data, av_frame_rgb->linesize, av_frame_rgb->width, av_frame_rgb->height, codec_ctx->pix_fmt, 1);
 }
 
-int VideoCapture::stop()
+void VideoCapture::blurPieces()
 {
-    return 0;
+    int img_width = cv_frame.cols;
+    int img_height = cv_frame.rows;
+
+    int block_width;
+    int block_height = img_height / grid_x;
+
+    int x_offset = 0;
+    int y_offset = 0;
+
+    int x_coord = 0;
+    int y_coord = 0;
+
+    while (y_offset < img_height)
+    {
+        block_width = img_width / grid_y;
+        while (x_offset < img_width)
+        {
+            if (img_width - block_width * 2 < x_offset)
+            {
+                block_width += img_width - x_offset - block_width;
+            }
+
+            if (grid_pos[y_coord * grid_y + x_coord])
+            {
+                cv::blur(cv_frame(cv::Rect(x_offset, y_offset, block_width, block_height)), cv_frame(cv::Rect(x_offset, y_offset, block_width, block_height)), cv::Size(kernel, kernel));
+            }
+
+            x_offset += block_width;
+
+            if (img_width - block_width < x_offset)
+            {
+                x_offset += img_width - x_offset;
+            }
+            x_coord++;
+        }
+
+        x_coord = 0;
+        x_offset = 0;
+        y_offset += block_height;
+
+        if (img_height - block_height * 2 < y_offset)
+        {
+            block_height += img_height - y_offset - block_height;
+        }
+
+        y_coord++;
+    }
+}
+
+int* VideoCapture::gen_grid()
+{
+    int *grid_positions = (int *)calloc(grid_y * grid_x, __SIZEOF_INT__);
+    int cnt = 1;
+    int x, y;
+
+    std::vector<std::string> cells = split(grid, ','); 
+    for (auto cell: cells)
+    {
+        std::vector<std::string> coords = split(cell, ':');
+        x = std::stoi(coords[1]);
+        y = std::stoi(coords[0]);
+        grid_positions[x * grid_y + y] = 1;
+    }
+
+    return grid_positions;
+}
+
+std::vector<std::string> VideoCapture::split(const std::string s, char delim) 
+{
+    std::vector<std::string> elems;
+    std::stringstream ss;
+    ss.str(s);
+    std::string item;
+
+    while (std::getline(ss, item, delim)) 
+    {
+        elems.push_back(item);
+    }
+
+    return elems;
+}
+
+void VideoCapture::parse_config(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        std::cout << "input config file path" << std::endl;
+        exit(1);
+    }
+    std::fstream file(argv[1]);
+
+    std::string test = std::string((std::istreambuf_iterator<char>(file)),
+                                        std::istreambuf_iterator<char>());
+    
+    nlohmann::json conf = nlohmann::json::parse(test);
+
+    cam_url = std::string(conf["cam_url"]);
+
+    grid_y = std::stoi(std::string(conf["grid_y"]).c_str());
+    grid_x = std::stoi(std::string(conf["grid_x"]).c_str());
+
+    grid = std::string(conf["grid"]);
+
+    kernel = std::stoi(std::string(conf["kernel"]).c_str());
+
+    video_path = std::string(conf["video_path"]);
+}
+
+void VideoCapture::stop()
+{
+    if (codec_ctx)
+    {
+        avcodec_free_context(&codec_ctx);
+        codec_ctx = NULL;
+    }
+
+    if (encode_ctx)
+    {
+        avcodec_free_context(&encode_ctx);
+        encode_ctx = NULL;
+    }
+
+    if (format_ctx)
+    {
+        avformat_close_input(&format_ctx);
+        format_ctx = NULL;
+    }
+
+    if (oformat)
+    {
+        avformat_close_input(&ofctx);
+        ofctx = NULL;
+    }
+
+    if (frame)
+    {
+        av_frame_free(&frame);
+        frame = NULL;
+    }
+
+    if (av_frame_gray)
+    {
+        av_freep(&av_frame_gray[0]);
+        av_frame_free(&av_frame_gray);
+        av_frame_gray = NULL;
+    }
+
+    if (av_frame_rgb)
+    {
+        av_freep(&av_frame_rgb[0]);
+        av_frame_free(&av_frame_rgb);
+        av_frame_rgb = NULL;
+    }
+
+    if (temp_frame)
+    {
+        av_freep(&temp_frame[0]);
+        av_frame_free(&temp_frame);
+        temp_frame = NULL;
+    } 
+
+    if (sws_ctx)
+    {
+        sws_freeContext(sws_ctx);
+        sws_ctx = NULL;
+    }
+
+    if (sws_ctx_rgb)
+    {
+        sws_freeContext(sws_ctx_rgb);
+        sws_ctx_rgb = NULL;
+    }
+
+    if (packet->size)
+    {
+        av_packet_unref(packet);
+        packet->size = 0;
+    }
 }
